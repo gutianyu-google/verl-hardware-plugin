@@ -155,6 +155,41 @@ def patch_tpu_sampler() -> None:
     logger.info("Applied TPU generator FP32 sampling-noise patch.")
 
 
+SILU_FP32_ENV = "VERL_TPU_VLLM_SILU_FP32"
+
+
+def patch_tpu_silu_fp32() -> bool:
+    """Compute SiLU(gate)*up in fp32 inside vLLM's ``SiluAndMul`` (``VERL_TPU_VLLM_SILU_FP32``; default on for tpu7x).
+
+    On TPU v7x the bf16 SiLU is evaluated natively in bf16, where v6e keeps f32 internally. Qwen3-4B's large
+    early-layer activations amplify the difference ~9x and it compounds through the stack: on v7x the greedy
+    step-0 GSM8K eval reads 0.633 instead of 0.550 (v6e / GPU), and the sampler's tokens sit a median 0.08 nats
+    below the fp32 argmax (v6e: 0.00). With this patch tpu7x matches v6e (0.550; 607 vs 605 identical outputs
+    against a GPU run). The trainer needs the same change (``_apply_fp32_silu_tpu`` in torchtitan_tpu.py): fixing
+    only one side exposes the other's error in the importance ratio. Cost: one fp32 upcast of the MLP activation
+    per layer; the matmuls stay bf16. Returns True when installed.
+    """
+    default = "1" if "7x" in os.environ.get("TPU_ACCELERATOR_TYPE", "").lower() else "0"
+    if os.environ.get(SILU_FP32_ENV, default) != "1":
+        return False
+    import torch.nn.functional as F
+    from vllm.model_executor.layers.activation import SiluAndMul
+
+    if getattr(SiluAndMul, "_verl_silu_fp32", False):
+        return True
+
+    def _silu_and_mul_fp32(self, x):
+        d = x.shape[-1] // 2
+        return (F.silu(x[..., :d].float()) * x[..., d:].float()).to(x.dtype)
+
+    for name in ("forward_native", "forward_tpu", "forward_oot", "forward_cuda", "forward_xpu", "forward_cpu"):
+        if hasattr(SiluAndMul, name):
+            setattr(SiluAndMul, name, _silu_and_mul_fp32)
+    SiluAndMul._verl_silu_fp32 = True
+    logger.warning("vLLM-TPU SiluAndMul: fp32 SiLU enabled (%s)", SILU_FP32_ENV)
+    return True
+
+
 def patch_vllm_for_tpu() -> None:
     """Install the patches in this process. Later calls return at once."""
     global _PATCHES_APPLIED
@@ -178,6 +213,7 @@ def patch_vllm_for_tpu() -> None:
 
     patch_tpu_logprobs()
     patch_tpu_sampler()
+    patch_tpu_silu_fp32()
 
     original_create_engine_config = EngineArgs.create_engine_config
 

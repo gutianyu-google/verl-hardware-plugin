@@ -95,6 +95,39 @@ class TPUEngineEvalModeCtx(BaseEngineCtx):
         super().__exit__(exc_type, exc_value, traceback)
 
 
+
+def _apply_fp32_silu_tpu(model) -> int:
+    """Bind an fp32 SiLU(w1 x) * w3 x forward on every SwiGLU FeedForward module (``VERL_TPU_TRAINER_SILU_FP32``;
+    default on for tpu7x). Same defect as the sampler-side ``patch_tpu_silu_fp32``: under bf16 autocast the v7x
+    bf16 SiLU raises the last-layer hidden-state error 3.4x and the logits error 5x against an fp32 reference;
+    with fp32 SiLU the trainer matches v6e. Both sides must be patched together. Returns the number of modules bound.
+    """
+    import os
+    from types import MethodType
+
+    import torch.nn.functional as _F
+
+    default = "1" if "7x" in os.environ.get("TPU_ACCELERATOR_TYPE", "").lower() else "0"
+    if os.environ.get("VERL_TPU_TRAINER_SILU_FP32", default) != "1":
+        return 0
+
+    def _ff_fp32(self, x):
+        g = self.w1(x)
+        u = self.w3(x)
+        return self.w2((_F.silu(g.float()) * u.float()).to(g.dtype))
+
+    n = 0
+    parts = list(model) if isinstance(model, (list, tuple)) else [model]  # the engine holds a list of model parts
+    for part in parts:
+        for m in part.modules():
+            if all(hasattr(m, k) for k in ("w1", "w2", "w3")) and not getattr(m, "_verl_fp32_silu", False):
+                m.forward = MethodType(_ff_fp32, m)
+                m._verl_fp32_silu = True
+                n += 1
+    logger.info("[v7x-port trainer] fp32 SiLU bound on %d FeedForward modules", n)
+    return n
+
+
 @EngineRegistry.register(
     model_type="language_model",
     backend="torchtitan",
@@ -187,6 +220,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
             apply_splash_attention_tpu(self.module)
         else:
             replace_varlen_attention_with_tpu_attention(self.module)
+        _apply_fp32_silu_tpu(self.module)
         if self.engine_config.forward_only:
             self.trainer.optimizers = None
             self.trainer.lr_schedulers = None
