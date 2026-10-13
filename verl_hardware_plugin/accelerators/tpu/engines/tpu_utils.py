@@ -46,6 +46,7 @@ def extend_torchtitan_engine_config() -> None:
         ("use_splash_attention", Optional[bool], None),
         ("use_simple_fsdp", Optional[bool], None),
         ("tpu_eager_mode", Optional[str], None),
+        ("activation_in_fp32", Optional[bool], None),
         ("pad_to_length", bool, False),
         ("pad_to_length_bucket", int, _DEFAULT_TPU_SEQ_BUCKET_SIZE),
     ]
@@ -146,6 +147,89 @@ def resolve_tpu_torchtitan_options(engine_config: Any) -> tuple[bool, bool, Opti
         raise ValueError(f"tpu_eager_mode {tpu_eager_mode!r} not supported")
 
     return use_splash_attention, use_simple_fsdp, tpu_eager_mode
+
+
+ACTIVATION_IN_FP32_ENV = "VERL_TPU_ACTIVATION_IN_FP32"
+# vllm-torchtpu's switch (VLLM_TPU_ACTIVATION_FP32): the activation families it evaluates in fp32.
+# ``silu`` covers the SwiGLU ops (SiluAndMul and friends), the only family the trainer side mirrors.
+VLLM_ACTIVATION_FP32_ENV = "VLLM_TPU_ACTIVATION_FP32"
+VLLM_ACTIVATION_FP32_FAMILIES = "silu"
+
+
+def resolve_tpu_activation_in_fp32(engine_config: Any = None) -> bool:
+    """Whether the SwiGLU activation is evaluated in fp32 on both sides of the rollout/trainer pair.
+
+    On TPU v7x the XLA:TPU lowering evaluates bf16 transcendentals natively in bf16, where v6e keeps
+    f32 internally; with Qwen3-4B's large early-layer activations that raises the logits error of a
+    forward about 5x against an fp32 reference. The fix is the same op on both sides: vllm-torchtpu's
+    ``VLLM_TPU_ACTIVATION_FP32=silu`` in the rollout and torchtitan's ``activation_in_fp32`` in the
+    trainer. One knob sets both, because fixing one side alone exposes the other's error in the
+    importance ratio (6x larger sampler/trainer mismatch, reward at step 10 0.41 instead of 0.58).
+
+    Precedence:
+    1. ``VERL_TPU_ACTIVATION_IN_FP32`` (``1``/``0``).
+    2. ``engine_config.activation_in_fp32`` (``actor_rollout_ref.actor.torchtitan.activation_in_fp32``,
+       registered by :func:`extend_torchtitan_engine_config`) when it is not ``None``.
+    3. Off.
+
+    There is no chip-based default on purpose: whether a chip needs this is a property of the
+    XLA:TPU version it runs, not of the hardware, so the recipe that targets v7x sets the knob
+    and the frameworks own any per-chip default.
+    """
+    env = _parse_optional_bool_env(ACTIVATION_IN_FP32_ENV)
+    if env is not None:
+        return env
+    cfg = getattr(engine_config, "activation_in_fp32", None)
+    if cfg is not None:
+        return bool(cfg)
+    return False
+
+
+def tpu_rollout_activation_env_vars() -> dict[str, str]:
+    """The vLLM-side half of :func:`resolve_tpu_activation_in_fp32`, for the rollout server's environment.
+
+    vLLM copies every ``VLLM_*`` variable of the server process to its Ray workers, where
+    vllm-torchtpu reads it before the model is built.
+    """
+    if not resolve_tpu_activation_in_fp32():
+        return {}
+    return {VLLM_ACTIVATION_FP32_ENV: VLLM_ACTIVATION_FP32_FAMILIES}
+
+
+def apply_activation_in_fp32_tpu(modules: Any) -> int:
+    """Switch on ``activation_in_fp32`` on every torchtitan module that has it (FeedForward, GELU, SiLU).
+
+    The trainer-side half of :func:`resolve_tpu_activation_in_fp32`. The attribute is read at
+    forward time, so this may run after the model is built, like the attention replacement.
+    Returns the number of modules switched on this call (0 when all were on already). Raises when
+    the model has no module with the attribute: that is a torchtitan without the knob, and silently
+    training with a bf16 activation against an fp32 rollout is the mismatch this knob exists to
+    prevent.
+    """
+    if modules is None:
+        return 0
+    model_list = modules if isinstance(modules, list | tuple | torch.nn.ModuleList) else [modules]
+    switched = 0
+    seen = 0
+    for model in model_list:
+        if not isinstance(model, torch.nn.Module):
+            continue
+        for module in model.modules():
+            if not hasattr(module, "activation_in_fp32"):
+                continue
+            seen += 1
+            if not module.activation_in_fp32:
+                module.activation_in_fp32 = True
+                switched += 1
+    if seen == 0 and any(isinstance(m, torch.nn.Module) for m in model_list):
+        raise ValueError(
+            "activation_in_fp32 is on but no module carries the attribute: this torchtitan has no "
+            "FeedForward.Config.activation_in_fp32. Upgrade torchtitan or set "
+            f"{ACTIVATION_IN_FP32_ENV}=0 on both the trainer and the rollout."
+        )
+    if switched:
+        logger.warning("fp32 activation enabled on %d torchtitan modules", switched)
+    return switched
 
 
 def configure_torch_compile_for_tpu(recompile_limit: int = 64) -> None:

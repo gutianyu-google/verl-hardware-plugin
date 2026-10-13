@@ -50,6 +50,7 @@ from verl.workers.engine.utils import (
 from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     align_micro_batch_shapes_across_ranks,
+    apply_activation_in_fp32_tpu,
     apply_splash_attention_tpu,
     bucket_length,
     compute_global_batch_num_tokens,
@@ -60,6 +61,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     pad_packed_inputs_for_tpu,
     prepare_tpu_loss_inputs,
     replace_varlen_attention_with_tpu_attention,
+    resolve_tpu_activation_in_fp32,
     resolve_tpu_torchtitan_options,
     synchronize_tpu_loss,
     tpu_eager_mode_context,
@@ -123,6 +125,7 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
             self._use_simple_fsdp,
             self._tpu_eager_mode,
         ) = resolve_tpu_torchtitan_options(engine_config)
+        self._activation_in_fp32 = resolve_tpu_activation_in_fp32(engine_config)
 
         if engine_config.use_torch_compile:
             configure_torch_compile_for_tpu()
@@ -136,6 +139,8 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
             apply_splash_attention_tpu(model_parts)
         else:
             replace_varlen_attention_with_tpu_attention(model_parts)
+        if self._activation_in_fp32:
+            apply_activation_in_fp32_tpu(model_parts)
 
         if engine_config.use_torch_compile and model_parts is not None:
             n_compiled = sum(
@@ -160,11 +165,13 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
             torch.distributed.barrier()
 
         logger.info(
-            "TorchTitanTPUEngineWithLMHead initialized (compile=%s, splash=%s, simple_fsdp=%s, eager_mode=%s)",
+            "TorchTitanTPUEngineWithLMHead initialized (compile=%s, splash=%s, simple_fsdp=%s, eager_mode=%s, "
+            "activation_in_fp32=%s)",
             engine_config.use_torch_compile,
             self._use_splash_attention,
             self._use_simple_fsdp,
             self._tpu_eager_mode,
+            self._activation_in_fp32,
         )
 
     def _drop_checkpoint_state_dict_cache(self) -> None:
@@ -187,6 +194,8 @@ class TorchTitanTPUEngineWithLMHead(TorchTitanEngineWithLMHead):
             apply_splash_attention_tpu(self.module)
         else:
             replace_varlen_attention_with_tpu_attention(self.module)
+        if self._activation_in_fp32:
+            apply_activation_in_fp32_tpu(self.module)
         if self.engine_config.forward_only:
             self.trainer.optimizers = None
             self.trainer.lr_schedulers = None

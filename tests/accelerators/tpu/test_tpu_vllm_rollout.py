@@ -277,6 +277,22 @@ def test_launch_tpu_vllm_servers_single_server_spanning_all_workers(tpu_vllm):
     assert replica._server_address == "10.0.0.1:8000"
 
 
+def test_launch_tpu_vllm_servers_passes_fp32_activation_to_vllm(tpu_vllm, monkeypatch):
+    monkeypatch.setenv("VERL_TPU_ACTIVATION_IN_FP32", "1")
+    replica = _fake_replica()
+    platform = SimpleNamespace(ray_noset_envvars=lambda: [], rollout_env_vars=lambda: {})
+
+    async def run():
+        with mock.patch.object(tpu_vllm, "get_platform", return_value=platform):
+            await tpu_vllm.launch_tpu_vllm_servers(replica)
+
+    asyncio.run(run())
+
+    env_vars = replica.server_class.options_kwargs["runtime_env"]["env_vars"]
+    # vLLM copies VLLM_* from the server process to its workers, where vllm-torchtpu reads it.
+    assert env_vars["VLLM_TPU_ACTIVATION_FP32"] == "silu"
+
+
 def test_launch_tpu_vllm_servers_rejects_data_parallel(tpu_vllm):
     with pytest.raises(NotImplementedError, match="data_parallel_size"):
         asyncio.run(tpu_vllm.launch_tpu_vllm_servers(_fake_replica(data_parallel_size=2)))

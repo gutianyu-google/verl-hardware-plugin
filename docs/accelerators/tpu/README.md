@@ -70,6 +70,14 @@ The two variables serve different purposes and must not be merged.
 v6e is the only generation this plugin supports. When the generation cannot be determined from
 Ray node labels or environment variables, the platform falls back to the v6e HBM figure.
 
+On TPU v7x the compiler evaluates bf16 SiLU natively in bf16 (v6e keeps f32 internally), which
+raises the logits error of a Qwen3-4B forward about 5x against an fp32 reference. On v7x, set
+`VERL_TPU_ACTIVATION_IN_FP32=1` (or `actor_rollout_ref.actor.torchtitan.activation_in_fp32=true`):
+the plugin then evaluates the SwiGLU activation in fp32 on both sides of RL, `VLLM_TPU_ACTIVATION_FP32=silu`
+in the vLLM rollout and torchtitan's `activation_in_fp32` in the trainer. One knob sets both on purpose:
+fixing one side alone shows up in the importance ratio. It is off by default on every generation; whether
+a chip needs it depends on the XLA:TPU version it runs, so the recipe decides, not a chip table.
+
 ## Related Documentation
 
 - [verl plugin system](../../development.md)

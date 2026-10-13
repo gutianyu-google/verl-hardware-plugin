@@ -21,6 +21,7 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     TPU_PADDED_VALUES_ATTR,
     TPUSplashAttention,
     TPUVarlenAttention,
+    apply_activation_in_fp32_tpu,
     apply_splash_attention_tpu,
     bucket_length,
     configure_torch_compile_for_tpu,
@@ -30,8 +31,10 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
     pad_packed_inputs_for_tpu,
     prepare_tpu_loss_inputs,
     replace_varlen_attention_with_tpu_attention,
+    resolve_tpu_activation_in_fp32,
     resolve_tpu_torchtitan_options,
     splash_block_size_for,
+    tpu_rollout_activation_env_vars,
     unwrap_metadata,
 )
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
@@ -472,3 +475,52 @@ def test_prepare_tpu_loss_inputs_ppo_falls_back_to_trimmed_outputs():
     loss_model_output, loss_data = prepare_tpu_loss_inputs(model_output, _ppo_micro_batch(lengths, 16))
     assert loss_model_output["log_probs"].values().shape == torch.Size([int(cu_seqlens[-1])])
     assert loss_data["responses"].offsets().diff().tolist() == [2, 5]
+
+
+def test_resolve_tpu_activation_in_fp32_precedence(monkeypatch):
+    monkeypatch.delenv("VERL_TPU_ACTIVATION_IN_FP32", raising=False)
+
+    # 3. Off unless asked for; no chip-based default.
+    assert resolve_tpu_activation_in_fp32() is False
+    assert resolve_tpu_activation_in_fp32(SimpleNamespace(activation_in_fp32=None)) is False
+    assert tpu_rollout_activation_env_vars() == {}
+
+    # 2. The engine config.
+    assert resolve_tpu_activation_in_fp32(SimpleNamespace(activation_in_fp32=True)) is True
+    assert resolve_tpu_activation_in_fp32(SimpleNamespace(activation_in_fp32=False)) is False
+    extend_torchtitan_engine_config()
+    assert resolve_tpu_activation_in_fp32(TorchtitanEngineConfig(attn_type="varlen")) is False
+    assert resolve_tpu_activation_in_fp32(TorchtitanEngineConfig(attn_type="varlen", activation_in_fp32=True)) is True
+
+    # 1. The environment beats the config, in both directions, and drives the rollout half.
+    monkeypatch.setenv("VERL_TPU_ACTIVATION_IN_FP32", "0")
+    assert resolve_tpu_activation_in_fp32(SimpleNamespace(activation_in_fp32=True)) is False
+    assert tpu_rollout_activation_env_vars() == {}
+    monkeypatch.setenv("VERL_TPU_ACTIVATION_IN_FP32", "1")
+    assert resolve_tpu_activation_in_fp32(SimpleNamespace(activation_in_fp32=False)) is True
+    assert tpu_rollout_activation_env_vars() == {"VLLM_TPU_ACTIVATION_FP32": "silu"}
+
+
+def test_apply_activation_in_fp32_tpu():
+    class _FFN(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.activation_in_fp32 = False
+
+    class _Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.feed_forward = _FFN()
+            self.norm = torch.nn.LayerNorm(4)
+
+    model = torch.nn.Sequential(_Block(), _Block())
+    assert apply_activation_in_fp32_tpu([model]) == 2
+    assert all(block.feed_forward.activation_in_fp32 for block in model)
+    # Idempotent on repeated calls (e.g. __init__ followed by initialize)
+    assert apply_activation_in_fp32_tpu([model]) == 0
+    assert apply_activation_in_fp32_tpu(None) == 0
+    assert apply_activation_in_fp32_tpu(["not a module"]) == 0
+
+    # A torchtitan without the knob must not train silently in bf16 against an fp32 rollout.
+    with pytest.raises(ValueError, match="activation_in_fp32"):
+        apply_activation_in_fp32_tpu(torch.nn.Sequential(torch.nn.LayerNorm(4)))

@@ -25,6 +25,7 @@ from verl.plugin.platform import get_platform
 from verl.utils.device import get_device_name
 from verl.utils.net_utils import is_valid_ipv6_address
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
+from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import tpu_rollout_activation_env_vars
 from verl_hardware_plugin.accelerators.tpu.rollout.tpu_vllm_patches import patch_vllm_for_tpu
 
 # vLLM imports the worker extension by name in its worker processes.
@@ -68,6 +69,9 @@ async def launch_tpu_vllm_servers(replica: vLLMReplica) -> None:
         "VLLM_USE_RAY_V2_EXECUTOR_BACKEND": "0",
         # The initialize_ray_cluster patch in patch_vllm_for_tpu attaches vLLM to these placement groups.
         "VERL_TPU_PG_IDS": ",".join(pg.id.hex() for pg in pgs),
+        # fp32 SwiGLU in the rollout when the trainer runs it too (TPU v7x numerics); see
+        # resolve_tpu_activation_in_fp32.
+        **tpu_rollout_activation_env_vars(),
     }
 
     server = replica.server_class.options(
