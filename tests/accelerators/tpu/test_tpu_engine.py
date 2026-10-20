@@ -302,8 +302,36 @@ def test_auto_assign_accelerator_type_single_slice_shares_slice():
         assert platform.auto_assign_accelerator_type("rollout_pool_0", None) == "tpu-group-0"
 
 
-def test_get_ray_init_kwargs_pins_tpu_platform():
+def _clear_forwarded_tpu_env(monkeypatch):
+    """Unset the variables the platform forwards, so the test shell's own exports do not leak in."""
+    for name in list(os.environ):
+        if name in ("LIBTPU_INIT_ARGS", "XLA_FLAGS") or name.startswith(("VERL_TPU_", "VERL_RAIDEN_")):
+            monkeypatch.delenv(name)
+
+
+def test_get_ray_init_kwargs_pins_tpu_platform(monkeypatch):
+    _clear_forwarded_tpu_env(monkeypatch)
     assert PlatformTPU().get_ray_init_kwargs() == {"runtime_env": {"env_vars": {"VERL_PLATFORM": "tpu"}}}
+
+
+def test_driver_tpu_env_is_forwarded_to_ray_workers(monkeypatch):
+    """The recipe's exports are set in the driver only; the platform names them in the job's runtime_env."""
+    _clear_forwarded_tpu_env(monkeypatch)
+    flags = "--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_bf16_emission_mode=PROMOTE_F32"
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", flags)
+    monkeypatch.setenv("XLA_FLAGS", "")  # empty: not forwarded, it would replace the workers' own value
+    monkeypatch.setenv("VERL_TPU_EAGER_MODE", "DEFER_AND_FUSE")
+    monkeypatch.setenv("VERL_RAIDEN_RELEASE_BUFFERS", "0")
+    monkeypatch.setenv("VERL_LOGGING_LEVEL", "DEBUG")  # not a TPU knob: not forwarded
+    env_vars = PlatformTPU().get_ray_init_kwargs()["runtime_env"]["env_vars"]
+    assert env_vars == {
+        "VERL_PLATFORM": "tpu",
+        "LIBTPU_INIT_ARGS": flags,
+        "VERL_TPU_EAGER_MODE": "DEFER_AND_FUSE",
+        "VERL_RAIDEN_RELEASE_BUFFERS": "0",
+    }
+    monkeypatch.setenv("XLA_FLAGS", "--xla_dump_to=/tmp/xla")
+    assert PlatformTPU().get_ray_init_kwargs()["runtime_env"]["env_vars"]["XLA_FLAGS"] == "--xla_dump_to=/tmp/xla"
 
 
 def test_get_tpu_seq_bucket_size_respects_pad_to_length_config():

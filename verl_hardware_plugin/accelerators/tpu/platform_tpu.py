@@ -50,6 +50,13 @@ def _ensure_torch_tpu() -> bool:
 
 _ensure_torch_tpu()  # Attempt at module load time so availability checks are faster later
 
+# Environment variables a recipe exports in the shell that runs the driver and that TPU worker processes
+# read: the libtpu / XLA compiler flags, and the plugin's own knobs (``VERL_TPU_*``, ``VERL_RAIDEN_*``). Ray
+# workers start from the raylet's environment, not the driver's, so the platform names them in the job's
+# runtime_env for them to reach the trainer workers, the rollout servers and vLLM's engine workers.
+TPU_FORWARDED_ENV_VARS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS")
+TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_", "VERL_RAIDEN_")
+
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471
 
@@ -313,6 +320,15 @@ class TPUDeviceModuleProxy:
                 logger.warning(f"Failed to clear TPU cache: {e}")
 
 
+def driver_tpu_env_for_workers() -> dict[str, str]:
+    """The forwarded variables (``TPU_FORWARDED_ENV_VARS`` and ``*_PREFIXES``) that are set and not empty."""
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if value and (name in TPU_FORWARDED_ENV_VARS or name.startswith(TPU_FORWARDED_ENV_PREFIXES))
+    }
+
+
 def configure_torchrun_tpu_env() -> None:
     """Populate PJRT multi-process environment variables when launched via ``torchrun``.
 
@@ -519,10 +535,23 @@ class PlatformTPU(PlatformBase):
         return False
 
     def get_ray_init_kwargs(self) -> dict[str, Any]:
-        """Pin the TPU platform inside Ray workers."""
+        """Pin the TPU platform inside Ray workers and forward the driver's TPU environment to them.
+
+        ``LIBTPU_INIT_ARGS``, ``XLA_FLAGS`` and the ``VERL_TPU_*`` / ``VERL_RAIDEN_*`` knobs that a recipe
+        exports are set in the driver process only; a Ray worker inherits the raylet's environment. Naming
+        them in the job-level ``runtime_env`` delivers them to every actor of the job, including actors
+        created with a ``runtime_env`` of their own: Ray merges ``env_vars`` per key between a child and its
+        parent (``ray.runtime_env._merge_runtime_env``), so the rollout servers and vLLM's engine workers get
+        them as well as the trainer workers. ``main_ppo`` applies this ``runtime_env`` through ``ray.init``,
+        which under ``ray job submit`` needs ``RAY_OVERRIDE_JOB_RUNTIME_ENV=1`` (the recipes set it).
+
+        A forwarded value replaces the one in a worker's own environment, so a flag meant for every process
+        goes in the recipe, not in the pod spec. Variables that are unset or empty in the driver's
+        environment are not forwarded and the workers keep their own.
+        """
         return {
             "runtime_env": {
-                "env_vars": {"VERL_PLATFORM": "tpu"},
+                "env_vars": {"VERL_PLATFORM": "tpu", **driver_tpu_env_for_workers()},
             }
         }
 
