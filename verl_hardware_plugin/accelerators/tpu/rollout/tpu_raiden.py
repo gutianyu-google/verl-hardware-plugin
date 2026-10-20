@@ -38,8 +38,6 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_checkpoint_engine import 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
-# Each rollout worker receives transfers on this port plus its rank.
-RAIDEN_SAMPLER_LISTENER_BASE_PORT = 12000
 # How long a rollout worker waits for the controller address and the trainer's tensor shapes.
 _REGISTRY_POLL_ATTEMPTS = 30
 _REGISTRY_POLL_INTERVAL_S = 0.5
@@ -141,11 +139,15 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
             f"global shapes found in RayWeightRegistry after timeout"
         )
 
-    def init_raiden_sync_on_worker(self, parallelism: int = raiden.RAIDEN_DEFAULT_PARALLELISM) -> bool:
+    def init_raiden_sync_on_worker(
+        self, parallelism: int = raiden.RAIDEN_DEFAULT_PARALLELISM, job_name: str = "sampler0"
+    ) -> bool:
         """Initialize Raiden WeightSynchronizer listener and register with central RaidenController.
 
-        Only the first call does work: the receive buffers, the synchronizer and the registration are
-        reused by every later sync.
+        ``job_name`` is the Raiden job this worker's replica registers under (the driver names every rollout
+        replica after its ``replica_rank``), so the ranks ``0..TP-1`` of several replicas do not collide on
+        the controller. Only the first call does work: the receive buffers, the synchronizer and the
+        registration are reused by every later sync.
         """
         if getattr(self, "_raiden_ws", None) is not None:
             return True
@@ -159,7 +161,9 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
 
         bind_ip = ray.util.get_node_ip_address().strip("[]")
         rank_val = getattr(self, "rank", 0)
-        listener_port = RAIDEN_SAMPLER_LISTENER_BASE_PORT + rank_val
+        # The listener port is assigned by the OS, as on the trainer side, and registered with the controller
+        # below; fixed ``base + rank`` ports collided when two replicas shared a host.
+        listener_port = 0
 
         # 1. Fetch RaidenController address and un-fused global shapes from RayWeightRegistry
         controller_addr, global_shapes_map = self._wait_for_raiden_registry(rank_val)
@@ -243,7 +247,7 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
 
         try:
             ctrl_client = raiden_controller.RaidenControllerClientFacade(controller_addr)
-            unit_id = raiden_controller.RaidenId("sampler", str(rank_val), "weights")
+            unit_id = raiden_controller.RaidenId(job_name, str(rank_val), "weights")
             ctrl_client.register_work_unit(
                 unit_id,
                 [f"{bind_ip}:{self._raiden_ws.local_port}"],
@@ -257,7 +261,7 @@ class vLLMRaidenWorkerExtension(vLLMColocateWorkerExtension):
             raise
         logger.info(
             f"Raiden Sampler Rank {rank_val} bound {len(valid_params)} dynamic staging tensors and registered "
-            f"directly with RaidenController ({controller_addr}): mesh_shape=[1, {tp_size}], "
+            f"directly with RaidenController ({controller_addr}) as {job_name}/{rank_val}: mesh_shape=[1, {tp_size}], "
             f"data_port={self._raiden_ws.local_port}, listener_port={self._raiden_ws.listener_port}"
         )
 

@@ -330,12 +330,17 @@ class _FakeServer:
         self.global_steps = global_steps
 
 
-def _make_manager(engines, weights_for_rank, samplers, events, num_replicas=1, backend="tpu-sync", **raiden_kwargs):
-    """A ``CheckpointEngineManager`` stand-in with ``num_replicas`` handles to one rollout server.
+def _make_manager(
+    engines, weights_for_rank, samplers, events, backend="tpu-sync", replica_samplers=None, **raiden_kwargs
+):
+    """A ``CheckpointEngineManager`` stand-in: one rollout server over ``samplers``, or, with ``replica_samplers``
+    (a list of sampler lists), one rollout server per replica over its own samplers (``replica_rank`` = position).
 
-    ``raiden_kwargs`` go to ``engine_kwargs[backend]``, where verl reads the engine kwargs of the backend.
+    ``raiden_kwargs`` go to ``engine_kwargs[backend]``, where verl reads the engine kwargs of the backend. Returns
+    the manager and the first server.
     """
-    server = _FakeServer(samplers, events)
+    servers = [_FakeServer(group, events) for group in (replica_samplers or [samplers])]
+    server = servers[0]
 
     async def abort_replicas():
         events.append("abort")
@@ -347,7 +352,10 @@ def _make_manager(engines, weights_for_rank, samplers, events, num_replicas=1, b
         backend=backend,
         config=SimpleNamespace(backend=backend, engine_kwargs={backend: raiden_kwargs}),
         actor_wg=_FakeActorWorkerGroup(engines, weights_for_rank, events, backend=backend),
-        replicas=[SimpleNamespace(server_handle=_FakeActorHandle(server), world_size=len(samplers))] * num_replicas,
+        replicas=[
+            SimpleNamespace(server_handle=_FakeActorHandle(server), world_size=len(server.workers), replica_rank=rank)
+            for rank, server in enumerate(servers)
+        ],
         abort_replicas=abort_replicas,
         resume_generation_replicas=resume_generation_replicas,
     )
@@ -835,9 +843,14 @@ def test_update_raiden_weights_end_to_end(fake_tpu_sync, tpu_raiden, caplog, tie
     assert set(metrics) == TIMING_KEYS and min(metrics.values()) >= 0
     (transfer,) = fake_tpu_sync.transfers
     assert transfer["src_units"] == [RaidenId("trainer", str(r), "weights") for r in range(trainer_ranks)]
-    assert transfer["dst_units"] == [RaidenId("sampler", str(r), "weights") for r in range(tp)]
+    assert transfer["dst_units"] == [RaidenId("sampler0", str(r), "weights") for r in range(tp)]
     assert (transfer["parallelism"], transfer["req_id"], transfer["dst_mem_type"]) == (4, "verl_step_0", "DRAM")
-    assert [sampler._raiden_ws.listener_port for sampler in samplers] == [12000, 12001]
+    # The listener port is OS-assigned (0 at creation) and the bound port is what the controller learns.
+    listener_ports = [sampler._raiden_ws.listener_port for sampler in samplers]
+    assert len(set(listener_ports)) == tp and all(port > 0 for port in listener_ports)
+    for rank, sampler in enumerate(samplers):
+        registration = fake_tpu_sync.registrations[RaidenId("sampler0", str(rank), "weights")]
+        assert registration.listener_address == f"10.0.0.1:{sampler._raiden_ws.listener_port}"
     assert [sampler._raiden_ws.parallelism for sampler in samplers] == [4, 4]
     assert ("lm_head.weight" in fake_tpu_sync.registry_state.get_global_shapes()) is not tie_word_embeddings
     # Released after the transfer: the send tensors are unbound, the synchronizers are kept for the next sync.
@@ -926,11 +939,53 @@ def test_parity_check_reports_mismatch(fake_tpu_sync, tpu_raiden, caplog):
     assert "model.embed_tokens.weight" in caplog.text
 
 
-def test_update_raiden_weights_requires_single_replica(fake_tpu_sync):
-    manager, _ = _make_manager([], lambda rank: iter(()), [], [], num_replicas=2)
-    with pytest.raises(NotImplementedError, match="single rollout replica"):
+def test_update_raiden_weights_syncs_several_replicas_in_one_transfer(fake_tpu_sync, tpu_raiden, caplog):
+    """Two TP=2 replicas: a job name and a port range per replica, one transfer, the parity check per replica."""
+    tp, trainer_ranks, num_replicas = 2, 2, 2
+    weights = _trainer_weights()
+    models = [[_FakeVllmModel(tp) for _ in range(tp)] for _ in range(num_replicas)]
+    samplers = [[_make_sampler(tpu_raiden, rank, tp, model) for rank, model in enumerate(group)] for group in models]
+    events: list = []
+    manager, _ = _make_manager(
+        [_trainer_engine(rank, verify_parity=True) for rank in range(trainer_ranks)],
+        lambda rank: iter(weights.items()),
+        None,
+        events,
+        replica_samplers=samplers,
+        verify_parity=True,
+    )
+    with caplog.at_level(logging.INFO, logger=raiden.__name__):
         asyncio.run(raiden.update_raiden_weights(manager, global_steps=1))
-    assert fake_tpu_sync.servers_started == 0
+
+    for group in models:
+        for rank, model in enumerate(group):
+            _assert_state(model, _expected_vllm_state(weights, rank, tp))
+    assert events.count("init_raiden_sync_on_worker") == num_replicas
+    (transfer,) = fake_tpu_sync.transfers
+    assert transfer["src_units"] == [RaidenId("trainer", str(r), "weights") for r in range(trainer_ranks)]
+    assert transfer["dst_units"] == [
+        RaidenId(f"sampler{replica}", str(rank), "weights") for replica in range(num_replicas) for rank in range(tp)
+    ]
+    assert transfer["req_id"] == "verl_step_1"
+    listener_ports = [sampler._raiden_ws.listener_port for group in samplers for sampler in group]
+    assert len(set(listener_ports)) == num_replicas * tp  # OS-assigned: distinct even when replicas share a host
+    assert "[RAIDEN PARITY VERIFIED | Step 1 | replica 0]" in caplog.text
+    assert "[RAIDEN PARITY VERIFIED | Step 1 | replica 1]" in caplog.text
+    assert "MISMATCH" not in caplog.text
+
+    # A replica with wrong weights is reported by name, at ERROR level; the other one still verifies.
+    samplers[1][0]._raiden_staging["model.embed_tokens.weight"].zero_()
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger=raiden.__name__):
+        asyncio.run(raiden._verify_parity_async(manager, global_steps=1))
+    assert "[RAIDEN PARITY MISMATCH | Step 1 | replica 1]" in caplog.text
+    assert "replica 0" not in caplog.text
+
+
+def test_sampler_job_names_follow_replica_rank():
+    # Keyed on replica_rank, so a replica keeps its name when others are added or removed.
+    assert raiden._sampler_job_name(SimpleNamespace(replica_rank=3), 0) == "sampler3"
+    assert raiden._sampler_job_name(SimpleNamespace(), 2) == "sampler2"  # no replica_rank: list position
 
 
 def test_wait_for_registration_times_out():
@@ -1017,7 +1072,7 @@ def test_update_raiden_weights_gqa_replicated_kv_heads(fake_tpu_sync, tpu_raiden
         _assert_state(model, _expected_vllm_state(weights, rank, tp))
     for rank in range(tp):
         variables = {
-            v.name: v for v in fake_tpu_sync.registrations[RaidenId("sampler", str(rank), "weights")].variables
+            v.name: v for v in fake_tpu_sync.registrations[RaidenId("sampler0", str(rank), "weights")].variables
         }
         for name in QKV[1:]:
             assert (variables[name].mesh_shape, variables[name].global_shard_indices) == ([KV_HEADS, 1], [rank // 2])
@@ -1040,15 +1095,16 @@ def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, tpu_raide
     assert sampler.init_raiden_sync_on_worker(parallelism=4) is True
 
     (ws,) = fake_tpu_sync.synchronizers
-    assert (ws.listener_port, ws.parallelism, ws.bind_ip) == (12001, 4, "10.0.0.1")
+    assert (ws.parallelism, ws.bind_ip) == (4, "10.0.0.1")
+    assert ws.listener_port > 0  # OS-assigned (requested as 0), registered with the controller below
     assert [tuple(t.shape) for t in ws.tensors] == [(8, 64), (128, 128), (128,)]
     assert all(t.dtype == torch.bfloat16 for t in ws.tensors)
     assert ws.skip_tiling is None  # skip-tiling is left to the planner, which sees both sides of the transfer
-    registration = fake_tpu_sync.registrations[RaidenId("sampler", "1", "weights")]
+    registration = fake_tpu_sync.registrations[RaidenId("sampler0", "1", "weights")]
     assert registration.address == "10.0.0.2:7777"
     assert (registration.mesh_shape, registration.mesh_axes) == ([1, 2], ["fsdp", "tp"])
     assert registration.data_addresses == [f"10.0.0.1:{ws.local_port}"]
-    assert registration.listener_address == "10.0.0.1:12001"
+    assert registration.listener_address == f"10.0.0.1:{ws.listener_port}"
     assert [
         (v.name, v.shape, v.mesh_shape, v.sharding_spec, v.global_shard_indices) for v in registration.variables
     ] == [
@@ -1065,6 +1121,18 @@ def test_sampler_init_allocates_tp_shards_and_registers(fake_tpu_sync, tpu_raide
     # Later syncs reuse the receive buffers and the registration.
     assert sampler.init_raiden_sync_on_worker(parallelism=4) is True
     assert len(fake_tpu_sync.synchronizers) == 1
+
+
+def test_sampler_init_registers_under_its_replica_job_name(fake_tpu_sync, tpu_raiden):
+    fake_tpu_sync.registry_state.set_controller_address("10.0.0.2:7777")
+    fake_tpu_sync.registry_state.set_global_shapes({"model.norm.weight": [128]})
+    sampler = _make_sampler(tpu_raiden, rank=1, tp=2, model=_FakeVllmModel(2))
+    assert sampler.init_raiden_sync_on_worker(parallelism=4, job_name="sampler1") is True
+
+    (ws,) = fake_tpu_sync.synchronizers
+    assert RaidenId("sampler0", "1", "weights") not in fake_tpu_sync.registrations
+    registration = fake_tpu_sync.registrations[RaidenId("sampler1", "1", "weights")]
+    assert registration.listener_address == f"10.0.0.1:{ws.listener_port}"
 
 
 def test_sampler_init_times_out_without_registry(fake_tpu_sync, tpu_raiden, monkeypatch):

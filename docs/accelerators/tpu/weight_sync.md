@@ -47,7 +47,8 @@ for this backend):
     model.
 - Network connectivity between the hosts:
   - from all trainer and rollout hosts to the Raiden controller, which runs in the driver process;
-  - from the trainer hosts to the rollout hosts. Rollout worker `k` listens on port `12000 + k`.
+  - from the trainer hosts to the rollout hosts. Every trainer and rollout worker listens on a port the
+    OS assigns and registers it with the controller, so no fixed port range needs to be open.
 
 ## Configuration
 
@@ -64,6 +65,22 @@ actor_rollout_ref.rollout.checkpoint_engine.backend=tpu-sync
 | `parallelism` | `8` | Parallel transfer streams per worker. |
 | `verify_parity` | `False` | After every sync, compare weight norms between trainer and rollout and log the result. Adds a pass over all weights on both sides, so it is meant for bring-up. |
 | `release_buffers_after_sync` | `True` | Unbind the send buffers (a bf16 copy of the full model on every trainer chip) after every transfer, so training gets that HBM back between syncs. Set to `False` to keep them resident. The environment variable `VERL_RAIDEN_RELEASE_BUFFERS` overrides the option on the trainer workers. |
+
+## Several rollout replicas
+
+verl creates one rollout replica per `tensor_model_parallel_size` chips of the rollout pool. With
+`tensor_model_parallel_size` equal to the number of rollout chips there is one replica (the recipes' default);
+with the chips of one host, one replica per rollout host. `tpu-sync` syncs any number of them: every replica
+registers under its own job name (`sampler<replica_rank>`), all of them receive in one transfer (Raiden
+shards it within each replica and broadcasts across the replicas), and the parity check (`verify_parity`)
+compares each replica with the trainer on its own, naming the replica in its result line:
+
+```text
+[RAIDEN PARITY VERIFIED | Step 3 | replica 0] 100% DISTRIBUTED NORM PARITY CONFIRMED!
+[RAIDEN PARITY MISMATCH | Step 3 | replica 1] Norms do NOT match!
+```
+
+Every replica tested so far sits on one host; replicas that span several hosts are not covered.
 
 ## Metrics
 

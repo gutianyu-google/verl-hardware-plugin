@@ -36,7 +36,7 @@ The rollout settings that matter on TPU (the recipes already set them):
 | Setting | Value on TPU |
 |---------|--------------|
 | `actor_rollout_ref.rollout.name` | `vllm` |
-| `actor_rollout_ref.rollout.tensor_model_parallel_size` | All chips of the rollout slice, e.g. `4` on v6e-4 |
+| `actor_rollout_ref.rollout.tensor_model_parallel_size` | All chips of the rollout slice, e.g. `4` on v6e-4, for one replica; the chips of one host for one replica per host (see [Weight Sync](./weight_sync.md#several-rollout-replicas)) |
 | `actor_rollout_ref.rollout.data_parallel_size` | `1` (the default); larger values are rejected |
 | `actor_rollout_ref.rollout.checkpoint_engine.backend` | `ray-plasma-store`, or `tpu-sync` (see [Weight Sync](./weight_sync.md)) |
 | `actor_rollout_ref.hybrid_engine` | `False` |
