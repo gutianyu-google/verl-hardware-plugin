@@ -53,15 +53,17 @@ _ensure_torch_tpu()  # Attempt at module load time so availability checks are fa
 # Base port for the TPU distributed slice builder mesh. Each local rank takes ``base + local_rank``.
 TPU_PROCESS_BASE_PORT = 8471
 
-# TPU chip HBM capacities in bytes
+# HBM capacity in bytes of one addressable device (a chip, or a TensorCore on TPU 7x)
 HBM_BYTES_TPU_V5P = 95 * 1024 * 1024 * 1024  # 95 GB
 HBM_BYTES_TPU_V6E = 32 * 1024 * 1024 * 1024  # 32 GB
-HBM_BYTES_TPU_V7X = 192 * 1024 * 1024 * 1024  # 192 GB
+# A TPU 7x chip has 192 GB and two TensorCores; a process drives one core, so this is what a process sees.
+HBM_BYTES_TPU_V7X = 96 * 1024 * 1024 * 1024  # 96 GB per TensorCore device
 
 TPU_HBM_BYTES_MAP = {
     "v5p": HBM_BYTES_TPU_V5P,
     "v6e": HBM_BYTES_TPU_V6E,
     "v7x": HBM_BYTES_TPU_V7X,
+    "tpu7x": HBM_BYTES_TPU_V7X,
 }
 
 # Fallback HBM capacity when the chip generation cannot be determined.
@@ -95,6 +97,105 @@ TPU_POD_TYPE_TOPOLOGY_MAP = {
 # the host bounds rather than across them.
 TPU_SINGLE_HOST_MAX_CHIPS = 4
 
+# TPU 7x (Ironwood): a chip has two TensorCores that torch_tpu drives as two devices, one process each,
+# so a slice is a 4-D mesh ``x,y,z,cores`` keyed by its number of DEVICES (what ``world_size`` counts).
+# A host holds 4 chips (``2x2x1``) = 8 devices; the multi-host entries follow the GKE slice shapes
+# (``2x2x2`` = 2 hosts, ``2x2x4`` = 4, ``2x4x4`` = 8, ``4x4x4`` = 16). Only whole hosts (and a single
+# device) are listed: a standalone process can open only a chip's first core, so sub-host meshes have
+# no validated layout.
+TPU_V7X_DEVICES_PER_HOST = 8
+TPU_V7X_TOPOLOGY_MAP = {
+    1: "1,1,1,1",
+    8: "2,2,1,2",
+    16: "2,2,2,2",
+    32: "2,2,4,2",
+    64: "2,4,4,2",
+    128: "4,4,4,2",
+}
+# One process per TensorCore: every process is a ``1,1,1,1`` cell of the mesh.
+TPU_V7X_PROCESS_BOUNDS = "1,1,1,1"
+
+
+def tpu_accelerator_name(pod_type: str = "") -> str:
+    """Lower-cased TPU generation or pod type: ``pod_type`` (what Ray reports, see ``ray_tpu_accelerator_name``)
+    or, failing that, the ``TPU_ACCELERATOR_TYPE`` / ``ACCELERATOR_TYPE`` / ``TPU_TYPE`` environment variables."""
+    return (
+        pod_type
+        or os.environ.get("TPU_ACCELERATOR_TYPE")
+        or os.environ.get("ACCELERATOR_TYPE")
+        or os.environ.get("TPU_TYPE")
+        or ""
+    ).lower()
+
+
+def is_tpu_v7x(pod_type: str = "") -> bool:
+    """Whether the slice is TPU 7x (see ``tpu_accelerator_name``).
+
+    The generation appears as ``tpu7x`` (GKE's accelerator label and ``TPU_ACCELERATOR_TYPE``), ``tpu7x-<n>``
+    (Ray's pod type) or ``v7x``; no other generation's name contains ``7x``.
+    """
+    return "7x" in tpu_accelerator_name(pod_type)
+
+
+def tpu_v7x_process_env(topology: str, rank: int, local_rank: int) -> dict[str, str]:
+    """The per-process variables of a TPU 7x mesh with one process per TensorCore.
+
+    libtpu lays the mesh out by process: the process bounds are the whole topology, every process holds one
+    device, and ``CLOUD_TPU_TASK_ID`` is the process's global rank (on v6e it is the index of its host).
+    ``TPU_VISIBLE_DEVICES`` names the device the way ``TPU_VISIBLE_CHIPS`` names the chip. The chip stays the
+    one Ray assigned: pinning ``TPU_VISIBLE_CHIPS`` to the rank with ``RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS``
+    makes Ray 2.56's core worker abort, and the Ray assignment formed the mesh correctly in every run.
+    """
+    return {
+        "TPU_PROCESS_BOUNDS": topology,
+        "TPU_CHIPS_PER_PROCESS_BOUNDS": TPU_V7X_PROCESS_BOUNDS,
+        "CLOUD_TPU_TASK_ID": str(rank),
+        "TPU_VISIBLE_DEVICES": str(local_rank),
+    }
+
+
+def ray_tpu_accelerator_name(node_ips: Optional[list[str]] = None) -> str:
+    """The pod type or accelerator type Ray reports for a TPU node (``""`` without Ray or TPU nodes).
+
+    Reads ``ray.io/tpu-pod-type``, else ``ray.io/accelerator-type``, of one alive TPU node: a node whose
+    address is in ``node_ips`` (the hosts of the pool being configured) when any is, so a cluster that
+    mixes generations is read per pool, otherwise the first TPU node.
+    """
+    try:
+        if not ray.is_initialized():
+            return ""
+        tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
+    except Exception as e:
+        logger.debug("Could not read the TPU node labels from Ray: %s", e)
+        return ""
+    if node_ips:
+        tpu_nodes = [node for node in tpu_nodes if node.get("NodeManagerAddress") in node_ips] or tpu_nodes
+    if not tpu_nodes:
+        return ""
+    labels = tpu_nodes[0].get("Labels", {})
+    return labels.get("ray.io/tpu-pod-type") or labels.get("ray.io/accelerator-type") or ""
+
+
+def tpu_mesh_env(total_chips: int, num_nodes: int, rank: int, local_rank: int, pod_type: str = "") -> dict[str, str]:
+    """The complete mesh environment of one process of a slice.
+
+    The topology and bounds of ``resolve_tpu_topology_bounds`` and, on TPU 7x, the per-process variables of
+    ``tpu_v7x_process_env``. Callers apply it after their generic defaults, so that on TPU 7x the task id is
+    the process's global rank rather than its host's index.
+    """
+    topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(
+        total_chips=total_chips, num_nodes=num_nodes, pod_type=pod_type
+    )
+    env = {
+        "TORCH_TPU_TOPOLOGY": topology,
+        "TPU_HOST_BOUNDS": host_bounds,
+        "TPU_CHIPS_PER_HOST_BOUNDS": chips_per_host_bounds,
+        "CHIPS_PER_HOST": chips_per_host,
+    }
+    if is_tpu_v7x(pod_type):
+        env.update(tpu_v7x_process_env(topology, rank=rank, local_rank=local_rank))
+    return env
+
 
 def resolve_tpu_topology_bounds(
     total_chips: int,
@@ -106,10 +207,27 @@ def resolve_tpu_topology_bounds(
     Resolution order for the topology is: the ``TORCH_TPU_TOPOLOGY`` escape hatch, then the pod
     type reported by Ray, then the chip count.
 
+    On TPU 7x (``pod_type`` or the accelerator-type environment names it) ``total_chips`` counts
+    TensorCore devices, the topology is the 4-D entry of ``TPU_V7X_TOPOLOGY_MAP`` and every process
+    is its own cell of the mesh, whatever the slice size.
+
     Raises:
         ValueError: if the topology cannot be determined. Guessing here is worse than failing:
             a wrong mesh does not error, it silently trains on part of the slice.
     """
+    inferred_chips_per_host = max(1, total_chips // max(1, num_nodes))
+    chips_per_host = str(os.environ.get("VERL_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
+
+    if is_tpu_v7x(pod_type):
+        topology = os.environ.get("TORCH_TPU_TOPOLOGY") or TPU_V7X_TOPOLOGY_MAP.get(total_chips)
+        if not topology:
+            raise ValueError(
+                f"Cannot determine the TPU 7x topology for {total_chips} devices (pod_type={pod_type!r}). "
+                "Set TORCH_TPU_TOPOLOGY='x,y,z,cores' to override. "
+                f"Known device counts: {sorted(TPU_V7X_TOPOLOGY_MAP)}."
+            )
+        return topology, topology, TPU_V7X_PROCESS_BOUNDS, chips_per_host
+
     topology = (
         os.environ.get("TORCH_TPU_TOPOLOGY")
         or TPU_POD_TYPE_TOPOLOGY_MAP.get(pod_type.lower())
@@ -121,9 +239,6 @@ def resolve_tpu_topology_bounds(
             f"(pod_type={pod_type!r}). Set TORCH_TPU_TOPOLOGY='x,y,z' to override. "
             f"Known chip counts: {sorted(DEFAULT_TPU_TOPOLOGY_MAP)}."
         )
-
-    inferred_chips_per_host = max(1, total_chips // max(1, num_nodes))
-    chips_per_host = str(os.environ.get("VERL_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
 
     if total_chips <= TPU_SINGLE_HOST_MAX_CHIPS:
         host_bounds = "1,1,1"
@@ -137,26 +252,7 @@ def resolve_tpu_topology_bounds(
 
 def get_tpu_chip_hbm_bytes() -> int:
     """Detect the TPU chip generation from Ray node labels or env vars and return its HBM capacity."""
-    tpu_type = ""
-
-    # Query Ray cluster node labels for TPU resource type
-    try:
-        if ray.is_initialized():
-            tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
-            if tpu_nodes:
-                labels = tpu_nodes[0].get("Labels", {})
-                tpu_type = (labels.get("ray.io/accelerator-type") or labels.get("ray.io/tpu-pod-type") or "").lower()
-    except Exception as e:
-        logger.warning(f"Unable to query Ray node labels for TPU chip type: {e}")
-
-    # Fallback to environment variables
-    if not tpu_type:
-        tpu_type = (
-            os.environ.get("TPU_ACCELERATOR_TYPE")
-            or os.environ.get("ACCELERATOR_TYPE")
-            or os.environ.get("TPU_TYPE")
-            or ""
-        ).lower()
+    tpu_type = tpu_accelerator_name(ray_tpu_accelerator_name())
 
     for chip_gen, hbm_bytes in TPU_HBM_BYTES_MAP.items():
         if chip_gen in tpu_type:
@@ -374,17 +470,18 @@ def configure_torchrun_tpu_env() -> None:
         os.environ.get("TPU_ACCELERATOR_TYPE") or os.environ.get("ACCELERATOR_TYPE") or os.environ.get("TPU_TYPE") or ""
     )
     try:
-        topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(
-            total_chips=world_size,
-            num_nodes=num_nodes,
-            pod_type=pod_type,
+        mesh_env = tpu_mesh_env(
+            total_chips=world_size, num_nodes=num_nodes, rank=rank, local_rank=local_rank, pod_type=pod_type
         )
-        os.environ.setdefault("TORCH_TPU_TOPOLOGY", topology)
-        os.environ.setdefault("TPU_HOST_BOUNDS", host_bounds)
-        os.environ.setdefault("TPU_CHIPS_PER_HOST_BOUNDS", chips_per_host_bounds)
-        os.environ.setdefault("CHIPS_PER_HOST", chips_per_host)
     except ValueError:
-        pass
+        return
+    if is_tpu_v7x(pod_type):
+        # The GKE TPU webhook pre-sets 3-D host bounds and a per-host task id on TPU 7x pods; the mesh is
+        # laid out by process here, so those are replaced rather than kept.
+        os.environ.update(mesh_env)
+    else:
+        for name, value in mesh_env.items():
+            os.environ.setdefault(name, value)
 
 
 @PlatformRegistry.register(platform="tpu")
@@ -629,23 +726,16 @@ class PlatformTPU(PlatformBase):
             "LOCAL_WORLD_SIZE": str(local_world_size),
         }
 
-        # Derive the mesh from the pod type Ray reports, falling back to the chip count.
-        tpu_nodes = [node for node in ray.nodes() if "TPU" in node.get("Resources", {}) and node.get("Alive")]
-        tpu_type = tpu_nodes[0].get("Labels", {}).get("ray.io/tpu-pod-type", "") if tpu_nodes else ""
-
-        topology, host_bounds, chips_per_host_bounds, chips_per_host = resolve_tpu_topology_bounds(
-            total_chips=world_size,
-            num_nodes=len(unique_hostnames),
-            pod_type=tpu_type,
-        )
-
+        # Derive the mesh from the pod type Ray reports for this pool's hosts, falling back to the chip count.
+        tpu_type = ray_tpu_accelerator_name(node_ips=unique_hostnames)
         env_vars.update(
-            {
-                "TORCH_TPU_TOPOLOGY": topology,
-                "TPU_HOST_BOUNDS": host_bounds,
-                "TPU_CHIPS_PER_HOST_BOUNDS": chips_per_host_bounds,
-                "CHIPS_PER_HOST": chips_per_host,
-            }
+            tpu_mesh_env(
+                total_chips=world_size,
+                num_nodes=len(unique_hostnames),
+                rank=rank,
+                local_rank=local_rank,
+                pod_type=tpu_type,
+            )
         )
 
         return env_vars

@@ -39,7 +39,12 @@ from verl_hardware_plugin.accelerators.tpu.engines.tpu_utils import (
 )
 from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
     PlatformTPU,
+    configure_torchrun_tpu_env,
+    get_tpu_chip_hbm_bytes,
+    ray_tpu_accelerator_name,
     resolve_tpu_topology_bounds,
+    tpu_mesh_env,
+    tpu_v7x_process_env,
 )
 
 
@@ -267,6 +272,121 @@ def test_resolve_tpu_topology_bounds_pod_type_and_env_override():
 
     with mock.patch.dict(os.environ, {"VERL_TPU_CHIPS_PER_HOST": "2"}):
         assert resolve_tpu_topology_bounds(total_chips=8, num_nodes=2)[3] == "2"
+
+
+def test_resolve_tpu_topology_bounds_tpu7x_one_process_per_core():
+    env = {k: v for k, v in os.environ.items() if k not in ("TORCH_TPU_TOPOLOGY", "TPU_ACCELERATOR_TYPE")}
+    with mock.patch.dict(os.environ, {**env, "TPU_ACCELERATOR_TYPE": "tpu7x"}, clear=True):
+        # One host: 4 chips = 8 TensorCore devices, each its own process, so the mesh is laid out by process.
+        assert resolve_tpu_topology_bounds(total_chips=8, num_nodes=1) == ("2,2,1,2", "2,2,1,2", "1,1,1,1", "8")
+        # An 8-host 2x4x4 slice: 64 devices.
+        assert resolve_tpu_topology_bounds(total_chips=64, num_nodes=8) == ("2,4,4,2", "2,4,4,2", "1,1,1,1", "8")
+        with pytest.raises(ValueError, match="TPU 7x topology"):
+            resolve_tpu_topology_bounds(total_chips=24, num_nodes=3)
+        with pytest.raises(ValueError, match="TPU 7x topology"):  # sub-host sizes have no validated layout
+            resolve_tpu_topology_bounds(total_chips=4, num_nodes=1)
+    # The pod type alone selects the TPU 7x table too.
+    with mock.patch.dict(os.environ, env, clear=True):
+        assert resolve_tpu_topology_bounds(total_chips=16, num_nodes=2, pod_type="tpu7x-16")[0] == "2,2,2,2"
+        assert resolve_tpu_topology_bounds(total_chips=16, num_nodes=4)[0] == "4,4,1"  # v6e as before
+    assert tpu_v7x_process_env("2,2,1,2", rank=13, local_rank=5) == {
+        "TPU_PROCESS_BOUNDS": "2,2,1,2",
+        "TPU_CHIPS_PER_PROCESS_BOUNDS": "1,1,1,1",
+        "CLOUD_TPU_TASK_ID": "13",
+        "TPU_VISIBLE_DEVICES": "5",
+    }
+
+
+def test_tpu_mesh_env_applies_the_process_layout_on_tpu7x_only():
+    env = {k: v for k, v in os.environ.items() if k not in ("TORCH_TPU_TOPOLOGY", "TPU_ACCELERATOR_TYPE")}
+    with mock.patch.dict(os.environ, env, clear=True):
+        assert tpu_mesh_env(8, 1, rank=5, local_rank=5, pod_type="tpu7x") == {
+            "TORCH_TPU_TOPOLOGY": "2,2,1,2",
+            "TPU_HOST_BOUNDS": "2,2,1,2",
+            "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1,1",
+            "CHIPS_PER_HOST": "8",
+            "TPU_PROCESS_BOUNDS": "2,2,1,2",
+            "TPU_CHIPS_PER_PROCESS_BOUNDS": "1,1,1,1",
+            "CLOUD_TPU_TASK_ID": "5",
+            "TPU_VISIBLE_DEVICES": "5",
+        }
+        assert tpu_mesh_env(8, 2, rank=5, local_rank=1) == {  # v6e: no per-process variables
+            "TORCH_TPU_TOPOLOGY": "2,4,1",
+            "TPU_HOST_BOUNDS": "2,4,1",
+            "TPU_CHIPS_PER_HOST_BOUNDS": "1,1,1",
+            "CHIPS_PER_HOST": "4",
+        }
+
+
+def test_configure_torchrun_tpu_env_tpu7x_replaces_the_webhook_bounds():
+    """GKE pre-sets 3-D bounds and a per-host task id on TPU 7x pods; torchrun on TPU 7x must replace them."""
+    keep = {k: v for k, v in os.environ.items() if not k.startswith(("TPU_", "TORCH_TPU_", "CLOUD_TPU_", "CHIPS_"))}
+    keep.pop("PJRT_DEVICE", None)
+    torchrun = {
+        "LOCAL_RANK": "5",
+        "RANK": "13",
+        "WORLD_SIZE": "16",
+        "LOCAL_WORLD_SIZE": "8",
+        "TPU_WORKER_HOSTNAMES": "10.0.0.1,10.0.0.2",
+        "TPU_ACCELERATOR_TYPE": "tpu7x",
+        "TPU_HOST_BOUNDS": "1,1,2",  # the webhook's 3-D values
+        "TPU_CHIPS_PER_HOST_BOUNDS": "2,2,1",
+    }
+    with mock.patch.dict(os.environ, {**keep, **torchrun}, clear=True):
+        configure_torchrun_tpu_env()
+        assert os.environ["CLOUD_TPU_TASK_ID"] == "13"
+        assert (
+            os.environ["TORCH_TPU_TOPOLOGY"]
+            == os.environ["TPU_HOST_BOUNDS"]
+            == os.environ["TPU_PROCESS_BOUNDS"]
+            == "2,2,2,2"
+        )
+        assert os.environ["TPU_CHIPS_PER_HOST_BOUNDS"] == os.environ["TPU_CHIPS_PER_PROCESS_BOUNDS"] == "1,1,1,1"
+        assert os.environ["TPU_VISIBLE_CHIPS"] == os.environ["TPU_VISIBLE_DEVICES"] == "5"
+        assert os.environ["TPU_PROCESS_PORT"] == "8476"
+    # v6e keeps a pre-set value, as before.
+    with mock.patch.dict(
+        os.environ, {**keep, **torchrun, "TPU_ACCELERATOR_TYPE": "v6e-16", "WORLD_SIZE": "16"}, clear=True
+    ):
+        configure_torchrun_tpu_env()
+        assert os.environ["TPU_HOST_BOUNDS"] == "1,1,2"
+        assert os.environ["CLOUD_TPU_TASK_ID"] == "1"
+
+
+def test_ray_tpu_accelerator_name_prefers_the_pools_own_nodes():
+    nodes = [
+        {
+            "Alive": True,
+            "Resources": {"TPU": 4.0},
+            "NodeManagerAddress": "10.0.0.1",
+            "Labels": {"ray.io/tpu-pod-type": "v6e-4"},
+        },
+        {
+            "Alive": True,
+            "Resources": {"TPU": 8.0},
+            "NodeManagerAddress": "10.0.0.2",
+            "Labels": {"ray.io/accelerator-type": "TPU7X"},
+        },
+        {
+            "Alive": False,
+            "Resources": {"TPU": 8.0},
+            "NodeManagerAddress": "10.0.0.3",
+            "Labels": {"ray.io/tpu-pod-type": "dead"},
+        },
+    ]
+    with mock.patch("ray.is_initialized", return_value=True), mock.patch("ray.nodes", return_value=nodes):
+        assert ray_tpu_accelerator_name() == "v6e-4"
+        assert ray_tpu_accelerator_name(node_ips=["10.0.0.2"]) == "TPU7X"
+        assert ray_tpu_accelerator_name(node_ips=["10.0.0.9"]) == "v6e-4"  # unknown hosts: first TPU node, as before
+    with mock.patch("ray.is_initialized", return_value=False):
+        assert ray_tpu_accelerator_name() == ""
+
+
+def test_tpu7x_hbm_is_per_tensorcore_device(monkeypatch):
+    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "tpu7x")
+    assert get_tpu_chip_hbm_bytes() == 96 * 1024**3
+    monkeypatch.setenv("TPU_ACCELERATOR_TYPE", "v6e-8")
+    assert get_tpu_chip_hbm_bytes() == 32 * 1024**3
 
 
 def test_resolve_tpu_topology_bounds_raises_on_unknown_slice():
