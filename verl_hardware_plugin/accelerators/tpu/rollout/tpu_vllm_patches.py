@@ -343,7 +343,11 @@ def _tpu_worker_envs(worker_ips: list[str], base_port: int, pod_type: str = "") 
     """
     hosts = list(dict.fromkeys(worker_ips))
     local_ranks = _local_ranks(worker_ips)
-    if is_tpu_v7x(pod_type):
+    # The engine's worker count defines its mesh: an engine may use part of a host's chips (two TP=4 engines
+    # on a v6e-8, say), so the pod type only tells TPU 7x apart and never selects a v6e layout.
+    v7x = is_tpu_v7x(pod_type)
+    pod_type = pod_type if v7x else ""
+    if v7x:
         partial = {ip: n for ip, n in Counter(worker_ips).items() if n != TPU_V7X_DEVICES_PER_HOST}
         if partial:
             raise ValueError(

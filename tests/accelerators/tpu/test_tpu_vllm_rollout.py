@@ -373,6 +373,16 @@ def test_tpu_worker_envs_two_hosts_of_four_chips():
     assert [e["CLOUD_TPU_TASK_ID"] for e in envs] == ["0"] * 4 + ["1"] * 4
 
 
+def test_tpu_worker_envs_v6e_engine_mesh_comes_from_its_worker_count():
+    """Two TP=4 engines on a v6e-8 host: each engine's mesh is its own 4 workers, not the host's 8 chips."""
+    env = {k: v for k, v in os.environ.items() if k not in ("TORCH_TPU_TOPOLOGY", "TPU_ACCELERATOR_TYPE")}
+    with mock.patch.dict(os.environ, env, clear=True):
+        envs = tpu_vllm_patches._tpu_worker_envs(["10.0.0.1"] * 4, base_port=8070, pod_type="v6e-8")
+    assert envs[3]["TORCH_TPU_TOPOLOGY"] == "2,2,1" and envs[3]["TPU_CHIPS_PER_HOST_BOUNDS"] == "2,2,1"
+    assert envs[3]["TPU_HOST_BOUNDS"] == "1,1,1" and envs[3]["CLOUD_TPU_TASK_ID"] == "0"
+    assert "TPU_VISIBLE_DEVICES" not in envs[3]
+
+
 def test_tpu_worker_envs_tpu7x_host_of_eight_cores():
     ips = ["10.0.0.1"] * 8  # one TP=8 engine on one host: 4 chips, 8 TensorCore devices, one worker each
     env = {k: v for k, v in os.environ.items() if k not in ("TORCH_TPU_TOPOLOGY", "TPU_ACCELERATOR_TYPE")}
