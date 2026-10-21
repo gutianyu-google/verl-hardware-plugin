@@ -33,12 +33,11 @@ To keep the plugin's `INFO` and `WARNING` logs from the driver process, such as 
 
 libtpu and XLA flags, and the plugin's `VERL_TPU_*` / `VERL_RAIDEN_*` knobs, go in the shell that runs the
 recipe, as the recipes do with `export LIBTPU_INIT_ARGS=...`. That shell is the driver process; Ray workers
-do not inherit its environment, so the platform names these variables in the job's `runtime_env`
-(`get_ray_init_kwargs`), which reaches every actor of the job, the rollout servers and vLLM's engine workers
-included. This relies on `RAY_OVERRIDE_JOB_RUNTIME_ENV=1`, which the recipes export, when the job is
-submitted with `ray job submit`. A forwarded value replaces one set in a worker pod's environment, so put
-flags meant for every process in the recipe. To check that a flag arrived, look for it in the `argv[...]`
-lines of the libtpu start-up dump that each TPU worker prints.
+do not inherit its environment, so the platform names these variables in the `env_vars` of every actor it
+launches: the worker groups through `get_worker_env_vars`, and the rollout servers through
+`rollout_env_vars`, from which vLLM's engine workers inherit them. A forwarded value replaces one set in a
+worker pod's environment, so put flags meant for every process in the recipe. To check that a flag arrived,
+look for it in the `argv[...]` lines of the libtpu start-up dump that each TPU worker prints.
 
 The rollout settings that matter on TPU (the recipes already set them):
 
