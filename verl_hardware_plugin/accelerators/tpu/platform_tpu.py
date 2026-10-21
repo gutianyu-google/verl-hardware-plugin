@@ -52,9 +52,8 @@ _ensure_torch_tpu()  # Attempt at module load time so availability checks are fa
 
 # Environment variables a recipe exports in the shell that runs the driver and that TPU worker processes
 # read: the libtpu / XLA compiler flags, and the plugin's own knobs (``VERL_TPU_*``, ``VERL_RAIDEN_*``). Ray
-# workers start from the raylet's environment, not the driver's, so the platform names them in the
-# ``env_vars`` of every actor it launches: the worker groups (``get_worker_env_vars``) and the rollout
-# servers (``rollout_env_vars``), whose vLLM engine workers inherit the server actor's runtime_env.
+# workers start from the raylet's environment, not the driver's, so the platform names them in the job's
+# runtime_env for them to reach the trainer workers, the rollout servers and vLLM's engine workers.
 TPU_FORWARDED_ENV_VARS = ("LIBTPU_INIT_ARGS", "XLA_FLAGS")
 TPU_FORWARDED_ENV_PREFIXES = ("VERL_TPU_", "VERL_RAIDEN_")
 
@@ -536,10 +535,23 @@ class PlatformTPU(PlatformBase):
         return False
 
     def get_ray_init_kwargs(self) -> dict[str, Any]:
-        """Pin the TPU platform inside Ray workers."""
+        """Pin the TPU platform inside Ray workers and forward the driver's TPU environment to them.
+
+        ``LIBTPU_INIT_ARGS``, ``XLA_FLAGS`` and the ``VERL_TPU_*`` / ``VERL_RAIDEN_*`` knobs that a recipe
+        exports are set in the driver process only; a Ray worker inherits the raylet's environment. Naming
+        them in the job-level ``runtime_env`` delivers them to every actor of the job, including actors
+        created with a ``runtime_env`` of their own: Ray merges ``env_vars`` per key between a child and its
+        parent (``ray.runtime_env._merge_runtime_env``), so the rollout servers and vLLM's engine workers get
+        them as well as the trainer workers. ``main_ppo`` applies this ``runtime_env`` through ``ray.init``,
+        which under ``ray job submit`` needs ``RAY_OVERRIDE_JOB_RUNTIME_ENV=1`` (the recipes set it).
+
+        A forwarded value replaces the one in a worker's own environment, so a flag meant for every process
+        goes in the recipe, not in the pod spec. Variables that are unset or empty in the driver's
+        environment are not forwarded and the workers keep their own.
+        """
         return {
             "runtime_env": {
-                "env_vars": {"VERL_PLATFORM": "tpu"},
+                "env_vars": {"VERL_PLATFORM": "tpu", **driver_tpu_env_for_workers()},
             }
         }
 
@@ -677,16 +689,8 @@ class PlatformTPU(PlatformBase):
         name_prefix: str,
         device_name: str,
     ) -> dict[str, str]:
-        """Return platform-specific TPU environment variables for worker nodes.
-
-        Starts from the driver's forwarded TPU environment (``driver_tpu_env_for_workers``): the
-        ``LIBTPU_INIT_ARGS``, ``XLA_FLAGS`` and ``VERL_TPU_*`` / ``VERL_RAIDEN_*`` values a recipe exports
-        are set in the driver process only, and a Ray worker inherits the raylet's environment. A
-        forwarded value replaces the one in a worker's own environment, so a flag meant for every
-        process goes in the recipe, not in the pod spec; variables unset or empty in the driver are
-        not forwarded and the workers keep their own. The slice and mesh variables come last and win.
-        """
-        env_vars = driver_tpu_env_for_workers()
+        """Return platform-specific TPU environment variables for worker nodes."""
+        env_vars = {}
         if "VERL_PLATFORM" in os.environ:
             env_vars["VERL_PLATFORM"] = os.environ["VERL_PLATFORM"]
         for var in self.ray_noset_envvars():
@@ -702,14 +706,3 @@ class PlatformTPU(PlatformBase):
         )
         env_vars.update(tpu_env)
         return env_vars
-
-    def rollout_env_vars(self) -> dict[str, str]:
-        """Forward the driver's TPU environment to the rollout server actors.
-
-        The servers are launched outside the worker groups (``tpu_vllm.launch_servers``), so
-        ``get_worker_env_vars`` does not reach them. vLLM's engine workers are children of the server
-        actor and inherit its runtime_env (Ray merges ``env_vars`` per key between a child and its
-        parent), so they receive the same values. vLLM's own copy-to-workers list does not cover
-        ``LIBTPU_INIT_ARGS`` or ``XLA_FLAGS``.
-        """
-        return driver_tpu_env_for_workers()

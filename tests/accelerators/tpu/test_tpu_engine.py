@@ -309,12 +309,13 @@ def _clear_forwarded_tpu_env(monkeypatch):
             monkeypatch.delenv(name)
 
 
-def test_get_ray_init_kwargs_pins_tpu_platform():
+def test_get_ray_init_kwargs_pins_tpu_platform(monkeypatch):
+    _clear_forwarded_tpu_env(monkeypatch)
     assert PlatformTPU().get_ray_init_kwargs() == {"runtime_env": {"env_vars": {"VERL_PLATFORM": "tpu"}}}
 
 
 def test_driver_tpu_env_is_forwarded_to_ray_workers(monkeypatch):
-    """The recipe's exports are set in the driver only; both actor launch paths name them in env_vars."""
+    """The recipe's exports are set in the driver only; the platform names them in the job's runtime_env."""
     _clear_forwarded_tpu_env(monkeypatch)
     flags = "--xla_tpu_use_enhanced_launch_barrier=false --xla_tpu_bf16_emission_mode=PROMOTE_F32"
     monkeypatch.setenv("LIBTPU_INIT_ARGS", flags)
@@ -322,33 +323,15 @@ def test_driver_tpu_env_is_forwarded_to_ray_workers(monkeypatch):
     monkeypatch.setenv("VERL_TPU_EAGER_MODE", "DEFER_AND_FUSE")
     monkeypatch.setenv("VERL_RAIDEN_RELEASE_BUFFERS", "0")
     monkeypatch.setenv("VERL_LOGGING_LEVEL", "DEBUG")  # not a TPU knob: not forwarded
-    forwarded = {
+    env_vars = PlatformTPU().get_ray_init_kwargs()["runtime_env"]["env_vars"]
+    assert env_vars == {
+        "VERL_PLATFORM": "tpu",
         "LIBTPU_INIT_ARGS": flags,
         "VERL_TPU_EAGER_MODE": "DEFER_AND_FUSE",
         "VERL_RAIDEN_RELEASE_BUFFERS": "0",
     }
-    platform = PlatformTPU()
-
-    # Rollout servers (and, by Ray runtime_env inheritance, vLLM's engine workers).
-    assert platform.rollout_env_vars() == forwarded
-
-    # Worker groups: forwarded values first, the slice and mesh variables last.
-    monkeypatch.setenv("VERL_PLATFORM", "tpu")
-    monkeypatch.setattr(PlatformTPU, "ray_noset_envvars", lambda self: ["RAY_NOSET"])
-    monkeypatch.setattr(PlatformTPU, "get_tpu_env_vars", lambda self, **kw: {"TPU_HOST_BOUNDS": "1,1,1"})
-    env_vars = platform.get_worker_env_vars(
-        resource_pool=SimpleNamespace(get_placement_groups=lambda device_name: []),
-        rank=0,
-        world_size=1,
-        local_rank=0,
-        local_world_size=1,
-        name_prefix="actor",
-        device_name="tpu",
-    )
-    assert env_vars == {**forwarded, "VERL_PLATFORM": "tpu", "RAY_NOSET": "1", "TPU_HOST_BOUNDS": "1,1,1"}
-
     monkeypatch.setenv("XLA_FLAGS", "--xla_dump_to=/tmp/xla")
-    assert platform.rollout_env_vars()["XLA_FLAGS"] == "--xla_dump_to=/tmp/xla"
+    assert PlatformTPU().get_ray_init_kwargs()["runtime_env"]["env_vars"]["XLA_FLAGS"] == "--xla_dump_to=/tmp/xla"
 
 
 def test_get_tpu_seq_bucket_size_respects_pad_to_length_config():
