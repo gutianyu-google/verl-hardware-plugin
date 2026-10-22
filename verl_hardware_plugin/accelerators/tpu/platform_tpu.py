@@ -294,8 +294,8 @@ def resolve_tpu_topology_bounds(
     chips_per_host = str(os.environ.get("VERL_TPU_CHIPS_PER_HOST", inferred_chips_per_host))
 
     if is_tpu_v7x(pod_type):
-        topology = resolve_tpu_v7x_topology(total_chips, num_nodes)
-        return topology, topology, TPU_V7X_PROCESS_BOUNDS, chips_per_host
+        v7x_topology = resolve_tpu_v7x_topology(total_chips, num_nodes)
+        return v7x_topology, v7x_topology, TPU_V7X_PROCESS_BOUNDS, chips_per_host
 
     topology = (
         os.environ.get("TORCH_TPU_TOPOLOGY")
