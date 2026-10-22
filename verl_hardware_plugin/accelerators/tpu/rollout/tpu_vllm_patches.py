@@ -42,7 +42,12 @@ import torch
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from verl_hardware_plugin.accelerators.tpu.platform_tpu import resolve_tpu_topology_bounds
+from verl_hardware_plugin.accelerators.tpu.platform_tpu import (
+    TPU_V7X_DEVICES_PER_HOST,
+    is_tpu_v7x,
+    ray_tpu_accelerator_name,
+    tpu_mesh_env,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -296,9 +301,10 @@ def _init_workers_ray(self, placement_group, **ray_remote_kwargs) -> None:
     }
     # torch_tpu's own rendezvous, separate from the torch.distributed one below.
     torch_tpu_master = {"MASTER_ADDR": ips[0], "MASTER_PORT": str(get_open_port())}
+    pod_type = ray_tpu_accelerator_name(node_ips=ips)
     self._env_vars_for_all_workers = [
         {**driver_env, **torch_tpu_master, **tpu_env}
-        for tpu_env in _tpu_worker_envs(ips, vllm_torchtpu_envs.TORCH_TPU_BASE_PORT)
+        for tpu_env in _tpu_worker_envs(ips, vllm_torchtpu_envs.TORCH_TPU_BASE_PORT, pod_type=pod_type)
     ]
     self.collective_rpc("update_environment_variables", args=(self._get_env_vars_to_be_updated(),))
     logger.info("TPU rollout process addresses: %s", self._env_vars_for_all_workers[0]["TPU_PROCESS_ADDRESSES"])
@@ -325,33 +331,48 @@ def _local_ranks(worker_ips: list[str]) -> list[int]:
     return [worker_ips[:rank].count(ip) for rank, ip in enumerate(worker_ips)]
 
 
-def _tpu_worker_envs(worker_ips: list[str], base_port: int) -> list[dict[str, str]]:
+def _tpu_worker_envs(worker_ips: list[str], base_port: int, pod_type: str = "") -> list[dict[str, str]]:
     """The TPU multi-host environment of each vLLM worker, for workers in rank order.
 
     Ranks on one host must be contiguous. A worker drives chip ``local_rank`` of its host and serves
     the slice builder on ``base_port + local_rank``. These are the variables libtpu and torch_tpu
-    read to join the workers into one TPU mesh.
+    read to join the workers into one TPU mesh. On TPU 7x (``pod_type`` or the accelerator-type
+    environment) a worker drives one TensorCore, the mesh is laid out by process, and an engine must span
+    whole hosts: a standalone process can open only a chip's first core, so an engine with fewer workers on
+    a host than that host has TensorCores has no layout and is rejected here.
     """
     hosts = list(dict.fromkeys(worker_ips))
     local_ranks = _local_ranks(worker_ips)
+    # The engine's worker count defines its mesh: an engine may use part of a host's chips (two TP=4 engines
+    # on a v6e-8, say), so the pod type only tells TPU 7x apart and never selects a v6e layout.
+    v7x = is_tpu_v7x(pod_type)
+    pod_type = pod_type if v7x else ""
+    if v7x:
+        partial = {ip: n for ip, n in Counter(worker_ips).items() if n != TPU_V7X_DEVICES_PER_HOST}
+        if partial:
+            raise ValueError(
+                f"On TPU 7x a vLLM engine spans whole hosts of {TPU_V7X_DEVICES_PER_HOST} TensorCore workers; "
+                f"this engine has {partial} workers per host. Set tensor_model_parallel_size to a multiple of "
+                f"{TPU_V7X_DEVICES_PER_HOST} (one engine per host, or per group of hosts)."
+            )
     addresses = ",".join(
         f"{ip}:{base_port + local_rank}" for ip, local_rank in zip(worker_ips, local_ranks, strict=True)
     )
-    topology, host_bounds, chips_per_host_bounds, _ = resolve_tpu_topology_bounds(len(worker_ips), len(hosts))
-    return [
-        {
+    envs = []
+    for rank, (ip, local_rank) in enumerate(zip(worker_ips, local_ranks, strict=True)):
+        env = {
             "TPU_VISIBLE_CHIPS": str(local_rank),
             "TPU_PROCESS_PORT": str(base_port + local_rank),
             "TPU_PROCESS_ADDRESSES": addresses,
             "TORCH_TPU_SLICEBUILDER_ADDRESSES": addresses,
             "CLOUD_TPU_TASK_ID": str(hosts.index(ip)),
             "TPU_WORKER_HOSTNAMES": ",".join(hosts),
-            "TORCH_TPU_TOPOLOGY": topology,
-            "TPU_HOST_BOUNDS": host_bounds,
-            "TPU_CHIPS_PER_HOST_BOUNDS": chips_per_host_bounds,
         }
-        for ip, local_rank in zip(worker_ips, local_ranks, strict=True)
-    ]
+        mesh_env = tpu_mesh_env(len(worker_ips), len(hosts), rank=rank, local_rank=local_rank, pod_type=pod_type)
+        mesh_env.pop("CHIPS_PER_HOST")  # a trainer-side variable; the rollout workers never carried it
+        env.update(mesh_env)
+        envs.append(env)
+    return envs
 
 
 def _execute_dag(self, scheduler_output, grammar_output, non_block=False):

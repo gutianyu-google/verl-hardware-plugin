@@ -68,12 +68,21 @@ The two variables serve different purposes and must not be merged.
 
 ## Chip Support
 
-| Generation | HBM per chip | Topologies with a built-in mapping |
-|------------|--------------|------------------------------------|
-| v6e | 32 GB | `v6e-4`, `v6e-8`, `v6e-32` |
+| Generation | HBM per device | Topologies with a built-in mapping |
+|------------|----------------|------------------------------------|
+| v6e | 32 GB per chip | `v6e-4`, `v6e-8`, `v6e-32`, and by chip count 1 to 256 |
+| TPU 7x (`tpu7x`) | 96 GB per TensorCore (192 GB per dual-core chip) | by device count: 8 (one `2x2x1` host), 16, 32, 64, 128 (`4x4x4`) |
 
-v6e is the only generation this plugin supports. When the generation cannot be determined from
-Ray node labels or environment variables, the platform falls back to the v6e HBM figure.
+On TPU 7x a chip has two TensorCores that `torch_tpu` drives as two devices, one process each: a host is
+8 devices, a slice is a 4-D mesh `x,y,z,cores`, and libtpu lays the mesh out by process (`CLOUD_TPU_TASK_ID`
+is the process's global rank, `TPU_VISIBLE_DEVICES` the process's core). A pool that spans its GKE slice
+takes the mesh from the slice shape the TPU webhook puts in the pod (`TPU_HOST_BOUNDS` times
+`TPU_CHIPS_PER_HOST_BOUNDS`, plus the core axis, as torchtitan's launcher computes it); a pool that uses
+part of a slice takes the whole-host shape for its device count from `TPU_V7X_TOPOLOGY_MAP` in
+`platform_tpu.py`. The generation comes from the `ray.io/tpu-pod-type` node label of the pool's hosts or
+from `TPU_ACCELERATOR_TYPE`; set `TORCH_TPU_TOPOLOGY='x,y,z,cores'` to override. Rollout engines on TPU 7x
+use one worker per TensorCore, e.g. a TP=8 engine per host; on every generation an engine's mesh is its
+own worker count. When the generation cannot be determined, the platform falls back to the v6e HBM figure.
 
 ## Related Documentation
 
